@@ -1,12 +1,5 @@
-﻿using InventoryManager.Common;
 using InventoryManager.Models;
-using System;
-using System.Collections.Generic;
-using System.Data.SqlClient;
 using System.Diagnostics;
-using System.IO;
-using System.Linq;
-using System.Net.Http;
 using System.Text;
 using System.Text.Json;
 
@@ -14,8 +7,10 @@ namespace InventoryManager.Services
 {
     public class ProductsService
     {
-        private EmailService _emailService;
-        private Settings _settings;
+        private readonly EmailService _emailService;
+        private readonly Settings _settings;
+        private readonly ErpNextService _erpNextService;
+
         public ProductsService(Config config)
         {
             _emailService = new EmailService(config);
@@ -26,12 +21,20 @@ namespace InventoryManager.Services
             _settings.ProductsToUpdate = config.ProductsToUpdate;
             _settings.SyncronizerReportReceivers = config.SyncronizerReportReceivers;
 
+            // ERPNext configuration
+            _settings.ErpNextUrl = config.ErpNextUrl;
+            _settings.ErpNextApiKey = config.ErpNextApiKey;
+            _settings.ErpNextApiSecret = config.ErpNextApiSecret;
+            _settings.ShortExpiryWarehouse = config.ShortExpiryWarehouse;
+            _settings.DamagedGoodsWarehouse = config.DamagedGoodsWarehouse;
+            _settings.WarehouseCodeMapping = config.WarehouseCodeMapping;
 
+            _erpNextService = new ErpNextService(_settings);
         }
 
         private HttpClient HttpClient => new HttpClient();
 
-        private Stopwatch Watch;
+        private Stopwatch? Watch;
 
         public bool StartWatch()
         {
@@ -40,8 +43,8 @@ namespace InventoryManager.Services
         }
         public double StopWatchAndReturnElapsedMilliseconds()
         {
-            Watch.Stop();
-            return (double)Watch.ElapsedMilliseconds;
+            Watch?.Stop();
+            return (double)(Watch?.ElapsedMilliseconds ?? 0);
         }
         public List<Product> GetAllWooCommerceProducts()
         {
@@ -74,58 +77,19 @@ namespace InventoryManager.Services
             return allProducts;
         }
 
-        public List<SapProduct> QuerySapProducts(string warehousesNumbers = null)
+        /// <summary>
+        /// Fetches products with stock from ERPNext for the specified warehouses.
+        /// Replaces the old QuerySapProducts() which used direct SQL against SAP.
+        /// </summary>
+        /// <param name="warehouses">
+        /// List of warehouse names or codes. If null, uses the default warehouses from config.
+        /// Supports both ERPNext warehouse names and old numeric codes via the fallback mapping.
+        /// </param>
+        public List<ErpNextProduct> QueryErpNextProducts(List<string>? warehouses = null)
         {
-            List<SapProduct> products = new List<SapProduct>();
-
-            using (SqlConnection connection = new SqlConnection(_settings.ConnectionString))
-            {
-
-                String sql = GetAllProductsSqlString(warehousesNumbers);
-
-                using (SqlCommand command = new SqlCommand(sql, connection))
-                {
-                    connection.Open();
-                    using (SqlDataReader reader = command.ExecuteReader())
-                    {
-                        while (reader.Read())
-                        {
-                            SapProduct item = ReflectPropertyInfo.ReflectType<SapProduct>(reader);
-                            products.Add(item);
-                        }
-                    }
-                    connection.Close();
-                }
-            }
-            if (_settings.ProductsToUpdate != null)
-            {
-                return products.Take((int)_settings.ProductsToUpdate).ToList();
-
-            }
-            return products;
+            return _erpNextService.GetProducts(warehouses);
         }
 
-        private string GetAllProductsSqlString(string wareHousesString = null)
-        {
-
-            if (string.IsNullOrEmpty(wareHousesString))
-            {
-                foreach (var whs in _settings.WhsToIncludeInInventory)
-                {
-                    wareHousesString += "'" + whs + "',";
-                }
-
-                wareHousesString = wareHousesString.Trim(',');
-            }
-
-            var sql = $"SELECT Q.*,ISNULL( QB.U_BlPack, 'N' ) as IsBlPackItem,ISNULL(QB.U_BlQty, 0 ) as BlPackQuantity, QB.U_BlWebId as BlPackWebId FROM (Select a.ItemCode,ItemName,sum (b.OnHand ) OnHand  from OITM a  inner  join oitw b on a.itemcode = b.itemcode left join OWHS whs on whs.WhsCode = b.WhsCode  Where whs.WhsCode in ({wareHousesString}) and a.validFor='Y'  and a.U_WebItem='Y' group by a.ItemCode, ItemName ) Q left join OITM QB on QB.ItemCode = Q.ItemCode order by Q.ItemCode";
-
-            if (_settings.ProductsToSkip != null)
-            {
-                sql += $"  offset {_settings.ProductsToSkip} rows";
-            }
-            return sql;
-        }
         public bool BatchUpdateProducts(ProductBatchUpdateModel model)
         {
             var url = _settings.GetProductsBatchUpdateUrl();
@@ -151,15 +115,15 @@ namespace InventoryManager.Services
         {
             var wooCommerceProducts = GetAllWooCommerceProducts();
 
-            var sapProducts = new List<SapProduct> { };
+            var erpNextProducts = new List<ErpNextProduct> { };
             try
             {
-                sapProducts = QuerySapProducts();
-
+                erpNextProducts = QueryErpNextProducts();
             }
             catch (Exception ex)
             {
-                LogMessage("[ERROR]: Unable to pull sap products. ErrorMessage: " + ex.Message);
+                Console.WriteLine("[ERROR]: Unable to pull ERPNext products: " + ex.Message);
+                LogMessage("[ERROR]: Unable to pull ERPNext products. ErrorMessage: " + ex.Message);
             }
 
 
@@ -182,19 +146,19 @@ namespace InventoryManager.Services
             var msg = "";
 
 
-            foreach (SapProduct sapProduct in sapProducts)
+            foreach (ErpNextProduct erpProduct in erpNextProducts)
             {
-                var wooCommerceProduct = wooCommerceProducts.FirstOrDefault(prod => prod.Sku == sapProduct.ItemCode);
+                var wooCommerceProduct = wooCommerceProducts.FirstOrDefault(prod => prod.Sku == erpProduct.ItemCode);
 
-                Product wooCommerceBulkProduct = null;
+                Product? wooCommerceBulkProduct = null;
 
-                if (sapProduct.IsBlPackItem == "Y")
+                if (erpProduct.IsBlPackItem == "Y")
                 {
-                    wooCommerceBulkProduct = wooCommerceProducts.FirstOrDefault(prod => prod.Sku != null && (prod.Sku.Contains(sapProduct.ItemCode)) && (prod.Sku.Contains("$")) && int.TryParse(prod.Sku.Substring(prod.Sku.IndexOf("$") + 1), out int bultQty));
+                    wooCommerceBulkProduct = wooCommerceProducts.FirstOrDefault(prod => prod.Sku != null && (prod.Sku.Contains(erpProduct.ItemCode)) && (prod.Sku.Contains("$")) && int.TryParse(prod.Sku.Substring(prod.Sku.IndexOf("$") + 1), out int bultQty));
                     if (wooCommerceBulkProduct == null)
                     {
-                        msg = $"The product {sapProduct.ItemName} ({sapProduct.ItemCode}) is missing a matching bulk quantity product on ecommerce.";
-                        missingEcommerceBulkProducts.Add($"{sapProduct.ItemCode} - {sapProduct.ItemName}");
+                        msg = $"The product {erpProduct.ItemName} ({erpProduct.ItemCode}) is missing a matching bulk quantity product on ecommerce.";
+                        missingEcommerceBulkProducts.Add($"{erpProduct.ItemCode} - {erpProduct.ItemName}");
                         missingEcommerceBulkCount++;
                         Console.WriteLine(msg);
                         LogMessage(msg);
@@ -203,15 +167,15 @@ namespace InventoryManager.Services
 
                 if (wooCommerceProduct != null || wooCommerceBulkProduct != null)
                 {
-                    if (wooCommerceProduct != null && sapProduct?.StockQty != wooCommerceProduct?.StockQuantity)
+                    if (wooCommerceProduct != null && erpProduct.StockQty != wooCommerceProduct.StockQuantity)
                     {
-                        updateList.update.Add(new ProductUpdateModel { id = wooCommerceProduct.Id, stock_quantity = sapProduct.StockQty, status = wooCommerceProduct.Status});
-                        productCodes.Add(sapProduct.ItemCode);
+                        updateList.update.Add(new ProductUpdateModel { id = wooCommerceProduct.Id, stock_quantity = erpProduct.StockQty, status = wooCommerceProduct.Status});
+                        productCodes.Add(erpProduct.ItemCode);
                      
                     }
                     if (wooCommerceBulkProduct != null)
                     {
-                        var stockQty = GetBulkItemStockQuantity(sapProduct);
+                        var stockQty = GetBulkItemStockQuantity(erpProduct);
 
                         if (stockQty != wooCommerceBulkProduct.StockQuantity)
                         {
@@ -223,14 +187,14 @@ namespace InventoryManager.Services
                 }
                 else
                 {
-                    msg = $"The product {sapProduct.ItemName} ({sapProduct.ItemCode}) is missing matching product(s) on ecommerce.";
-                    missingEcommerceProducts.Add($"{sapProduct.ItemCode} - {sapProduct.ItemName}");
+                    msg = $"The product {erpProduct.ItemName} ({erpProduct.ItemCode}) is missing matching product(s) on ecommerce.";
+                    missingEcommerceProducts.Add($"{erpProduct.ItemCode} - {erpProduct.ItemName}");
                     missingEcomerceCount++;
                     Console.WriteLine(msg);
                     LogMessage(msg);
                 }
 
-                if (updateList.update.Count >= 9 || counter == (sapProducts.Count() - 1))
+                if (updateList.update.Count >= 9 || counter == (erpNextProducts.Count() - 1))
                 {
                     if (!updateList.update.Any())
                     {
@@ -277,15 +241,15 @@ namespace InventoryManager.Services
         {
             var missingShortExpiryProducts = new List<string> { };
 
-            var sapProducts = new List<SapProduct> { };
+            var erpNextProducts = new List<ErpNextProduct> { };
             try
             {
-                sapProducts = QuerySapProducts("'04'");
-
+                var shortExpiryWarehouse = _settings.ResolveWarehouse(_settings.ShortExpiryWarehouse);
+                erpNextProducts = QueryErpNextProducts(new List<string> { shortExpiryWarehouse });
             }
             catch (Exception ex)
             {
-                LogMessage("[ERROR]: Unable to pull sap products. ErrorMessage: " + ex.Message);
+                LogMessage("[ERROR]: Unable to pull ERPNext products for short expiry. ErrorMessage: " + ex.Message);
             }
 
 
@@ -304,27 +268,27 @@ namespace InventoryManager.Services
             var updatedSeProducts = new List<string> { };
             var msg = "";
 
-            foreach (SapProduct sapProduct in sapProducts)
+            foreach (ErpNextProduct erpProduct in erpNextProducts)
             {
-                var wooCommerceProduct = wooCommerceProducts.FirstOrDefault(prod => prod.Sku == sapProduct.ItemCode + "@SE");
+                var wooCommerceProduct = wooCommerceProducts.FirstOrDefault(prod => prod.Sku == erpProduct.ItemCode + "@SE");
 
                 if (wooCommerceProduct != null)
                 {
-                    if (sapProduct.StockQty <= 0 && wooCommerceProduct.Status != "draft")
+                    if (erpProduct.StockQty <= 0 && wooCommerceProduct.Status != "draft")
                     {
-                        updateList.update.Add(new ProductUpdateModel { id = wooCommerceProduct.Id, stock_quantity = sapProduct.StockQty , status = "draft"});
-                        productCodes.Add(sapProduct.ItemCode);
+                        updateList.update.Add(new ProductUpdateModel { id = wooCommerceProduct.Id, stock_quantity = erpProduct.StockQty , status = "draft"});
+                        productCodes.Add(erpProduct.ItemCode);
                     }
-                    else if (wooCommerceProduct != null && sapProduct.StockQty != wooCommerceProduct.StockQuantity)
+                    else if (wooCommerceProduct != null && erpProduct.StockQty != wooCommerceProduct.StockQuantity)
                     {
-                        updateList.update.Add(new ProductUpdateModel { id = wooCommerceProduct.Id, stock_quantity = sapProduct.StockQty , status = "publish" });
-                        productCodes.Add(sapProduct.ItemCode);
+                        updateList.update.Add(new ProductUpdateModel { id = wooCommerceProduct.Id, stock_quantity = erpProduct.StockQty , status = "publish" });
+                        productCodes.Add(erpProduct.ItemCode);
                     }
-                    updatedSeProducts.Add(sapProduct.ItemCode);
+                    updatedSeProducts.Add(erpProduct.ItemCode);
                 }
                
 
-                if (updateList.update.Count >= 10 || counter == (sapProducts.Count() - 1))
+                if (updateList.update.Count >= 10 || counter == (erpNextProducts.Count() - 1))
                 {
                     if (!updateList.update.Any())
                     {
@@ -352,9 +316,9 @@ namespace InventoryManager.Services
             Console.WriteLine(msg);
             LogMessage(msg);
 
-            var sapSeProductsWithInventory = sapProducts.Where(prod => prod.StockQty > 0);
-            var sapSeProductsNotUpdated = sapSeProductsWithInventory.Where(x => !updatedSeProducts.Contains(  x.ItemCode));
-            foreach (var seProd in sapSeProductsNotUpdated)
+            var erpSeProductsWithInventory = erpNextProducts.Where(prod => prod.StockQty > 0);
+            var erpSeProductsNotUpdated = erpSeProductsWithInventory.Where(x => !updatedSeProducts.Contains(  x.ItemCode));
+            foreach (var seProd in erpSeProductsNotUpdated)
             {
                 missingShortExpiryProducts.Add($"{seProd.ItemCode} - {seProd.ItemName}");
             }
@@ -364,15 +328,15 @@ namespace InventoryManager.Services
         {
             var missingDamagedProducts = new List<string> { };
 
-            var sapProducts = new List<SapProduct> { };
+            var erpNextProducts = new List<ErpNextProduct> { };
             try
             {
-                sapProducts = QuerySapProducts("'02'");
-
+                var damagedWarehouse = _settings.ResolveWarehouse(_settings.DamagedGoodsWarehouse);
+                erpNextProducts = QueryErpNextProducts(new List<string> { damagedWarehouse });
             }
             catch (Exception ex)
             {
-                LogMessage("[ERROR]: Unable to pull sap products. ErrorMessage: " + ex.Message);
+                LogMessage("[ERROR]: Unable to pull ERPNext products for damaged goods. ErrorMessage: " + ex.Message);
             }
 
 
@@ -391,27 +355,27 @@ namespace InventoryManager.Services
             var updatedDamagedProducts = new List<string> { };
             var msg = "";
 
-            foreach (SapProduct sapProduct in sapProducts)
+            foreach (ErpNextProduct erpProduct in erpNextProducts)
             {
-                var wooCommerceProduct = wooCommerceProducts.FirstOrDefault(prod => prod.Sku == sapProduct.ItemCode + "@DE");
+                var wooCommerceProduct = wooCommerceProducts.FirstOrDefault(prod => prod.Sku == erpProduct.ItemCode + "@DE");
 
                 if (wooCommerceProduct != null)
                 {
-                    if (sapProduct.StockQty <= 0 && wooCommerceProduct.Status != "draft")
+                    if (erpProduct.StockQty <= 0 && wooCommerceProduct.Status != "draft")
                     {
-                        updateList.update.Add(new ProductUpdateModel { id = wooCommerceProduct.Id, stock_quantity = sapProduct.StockQty, status = "draft" });
-                        productCodes.Add(sapProduct.ItemCode);
+                        updateList.update.Add(new ProductUpdateModel { id = wooCommerceProduct.Id, stock_quantity = erpProduct.StockQty, status = "draft" });
+                        productCodes.Add(erpProduct.ItemCode);
                     }
-                    else if (wooCommerceProduct != null && sapProduct.StockQty != wooCommerceProduct.StockQuantity)
+                    else if (wooCommerceProduct != null && erpProduct.StockQty != wooCommerceProduct.StockQuantity)
                     {
-                        updateList.update.Add(new ProductUpdateModel { id = wooCommerceProduct.Id, stock_quantity = sapProduct.StockQty, status = "publish" });
-                        productCodes.Add(sapProduct.ItemCode);
+                        updateList.update.Add(new ProductUpdateModel { id = wooCommerceProduct.Id, stock_quantity = erpProduct.StockQty, status = "publish" });
+                        productCodes.Add(erpProduct.ItemCode);
                     }
-                    updatedDamagedProducts.Add(sapProduct.ItemCode);
+                    updatedDamagedProducts.Add(erpProduct.ItemCode);
                 }
 
 
-                if (updateList.update.Count >= 10 || counter == (sapProducts.Count() - 1))
+                if (updateList.update.Count >= 10 || counter == (erpNextProducts.Count() - 1))
                 {
                     if (!updateList.update.Any())
                     {
@@ -439,22 +403,22 @@ namespace InventoryManager.Services
             Console.WriteLine(msg);
             LogMessage(msg);
 
-            var sapDamagedProductsWithInventory = sapProducts.Where(prod => prod.StockQty > 0);
-            var sapDamagedProductsNotUpdated = sapDamagedProductsWithInventory.Where(x => !updatedDamagedProducts.Contains(x.ItemCode));
-            foreach (var seProd in sapDamagedProductsNotUpdated)
+            var erpDamagedProductsWithInventory = erpNextProducts.Where(prod => prod.StockQty > 0);
+            var erpDamagedProductsNotUpdated = erpDamagedProductsWithInventory.Where(x => !updatedDamagedProducts.Contains(x.ItemCode));
+            foreach (var seProd in erpDamagedProductsNotUpdated)
             {
                 missingDamagedProducts.Add($"{seProd.ItemCode} - {seProd.ItemName}");
             }
             return missingDamagedProducts;
 
         }
-        private decimal GetBulkItemStockQuantity(SapProduct sapProduct)
+        private decimal GetBulkItemStockQuantity(ErpNextProduct erpProduct)
         {
-            var quantity = sapProduct?.StockQty ?? 0;
+            var quantity = erpProduct.StockQty;
 
-            if (sapProduct.IsBlPackItem == "Y" && (sapProduct?.BlPackQuantity ?? 0) > 1)
+            if (erpProduct.IsBlPackItem == "Y" && erpProduct.BlPackQuantity > 1)
             {
-                quantity = ((int)(sapProduct?.StockQty ?? 0)) / (sapProduct?.BlPackQuantity ?? 0);
+                quantity = ((int)erpProduct.StockQty) / erpProduct.BlPackQuantity;
             }
 
             return quantity;
@@ -462,19 +426,19 @@ namespace InventoryManager.Services
         public List<Product> GetProductsFromJson(string content)
         {
 
-            return JsonSerializer.Deserialize<List<Product>>(content);
+            return JsonSerializer.Deserialize<List<Product>>(content) ?? new List<Product>();
         }
-        public Product GetProductFromJson(string content)
+        public Product? GetProductFromJson(string content)
         {
 
-            return JsonSerializer.Deserialize<List<Product>>(content).FirstOrDefault();
+            return JsonSerializer.Deserialize<List<Product>>(content)?.FirstOrDefault();
         }
         public void LogMessage(string messsage)
         {
             var dateToday = DateTime.Now;
             var filename = $"{dateToday.Year}-{dateToday.Month}-{dateToday.Day}-log.txt";
 
-            string filePath = System.IO.Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), filename);
+            string filePath = System.IO.Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location)!, filename);
 
             using (StreamWriter sw = File.AppendText(filePath))
             {

@@ -1,24 +1,12 @@
-﻿using InventoryManager.Models;
+using InventoryManager.Models;
 using InventoryManager.Services;
-using Microsoft.Extensions.Logging;
-using System;
-using System.Collections.Generic;
-using System.Collections.Specialized;
-using System.Configuration;
-using System.IO;
-using System.Linq;
-using System.Security.Cryptography.X509Certificates;
-using System.Text;
 using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Text.RegularExpressions;
-using System.Threading.Tasks;
 
 namespace InventoryManager
 {
     internal class Program
     {
-
 
         static void Main(string[] args)
         {
@@ -59,10 +47,10 @@ namespace InventoryManager
 
         private static Config GetConfigs(string[] args)
         {
-            var configs = new Config();
+            Config? configs = null;
             try
             {
-                using (StreamReader r = new StreamReader(Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), "appsettings.json")))
+                using (StreamReader r = new StreamReader(Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location)!, "appsettings.json")))
                 {
                     string text = r.ReadToEnd();
                     configs = JsonSerializer.Deserialize<Config>(text);
@@ -74,6 +62,12 @@ namespace InventoryManager
                 Environment.Exit(1);
             }
 
+            if (configs == null)
+            {
+                LogMessage("Configuration is null. Kindly check your appsettings.json");
+                Environment.Exit(1);
+                return new Config(); // Unreachable but satisfies compiler
+            }
 
             var validArgs = new List<string> { "ProductsToSkip", "ProductsToUpdate", "SyncronizerReportReceivers", "WarehousesToIncludeInInventory" };
             var counter = 0;
@@ -117,16 +111,13 @@ namespace InventoryManager
                             break;
                         case "warehousestoincludeininventory":
                             var whss = args[counter + 1];
-                            var validWhsNumbers = new List<string> { "01", "02", "03", "04", "05", "06", "07", "08", "09", "10", "11", "12" };
                             if (!string.IsNullOrWhiteSpace(whss))
                             {
-                                var emailsList = whss.Split(',');
+                                var warehouseList = whss.Split(',').ToList();
 
-                                var valisWhss = emailsList.Where(x => validWhsNumbers.Contains(x)).ToList();
-
-                                if (valisWhss.Any())
+                                if (warehouseList.Any())
                                 {
-                                    configs.WarehousesToIncludeInInventory = valisWhss;
+                                    configs.WarehousesToIncludeInInventory = warehouseList;
                                 }
                                 else
                                 {
@@ -154,7 +145,7 @@ namespace InventoryManager
             var dateToday = DateTime.Now;
             var filename = $"{dateToday.Year}-{dateToday.Month}-{dateToday.Day}-log.txt";
 
-            string filePath = System.IO.Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location), filename);
+            string filePath = System.IO.Path.Combine(Path.GetDirectoryName(System.Reflection.Assembly.GetExecutingAssembly().Location)!, filename);
 
             using (StreamWriter sw = File.AppendText(filePath))
             {

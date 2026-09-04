@@ -1,13 +1,6 @@
-﻿using InventoryManager.Models;
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
+using InventoryManager.Models;
 using System.Net;
 using System.Net.Mail;
-using System.Runtime.InteropServices;
-using System.Text;
-using System.Threading.Tasks;
 
 namespace InventoryManager.Services
 {
@@ -26,7 +19,7 @@ namespace InventoryManager.Services
         }
         private Settings _settings;
 
-        public void SendMail(List<string> to, string from, string subject, string body, string filePath)
+        public void SendMail(List<string> to, string from, string subject, string body, string? filePath)
         {
             MailMessage message = new MailMessage();
             message.From = new MailAddress(from);
@@ -45,9 +38,8 @@ namespace InventoryManager.Services
                     message.Attachments.Add(new Attachment(filePath));
 
                 }
-                catch (Exception ex)
+                catch (Exception)
                 {
-
                 }
             }
 
